@@ -5,11 +5,13 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import numpy as np
 from typing_extensions import override
 import tyro
 
@@ -20,6 +22,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.skillweaver_policy as skillweaver_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -95,6 +98,47 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # Path to the data filter file for DROID dataset
     filter_dict_path: str | None = None
+
+    # Used by IsaacLabRldsDataset (list of TFRecord shard directories).
+    rlds_data_dirs: list[str] = dataclasses.field(default_factory=list)
+    # Additional training directories, always fully included (e.g. LIBERO demos).
+    rlds_extra_dirs_full: list[str] = dataclasses.field(default_factory=list)
+    # Optional validation directories for IsaacLabRldsDataset. When non-empty, train.py
+    # logs val/loss and end-effector errors every eval_interval steps.
+    rlds_val_data_dirs: list[str] = dataclasses.field(default_factory=list)
+    # Which RLDS dataset class to use: "droid" → DroidRldsDataset (default when
+    # rlds_data_dir is set), "isaaclab" → IsaacLabRldsDataset (set by RLDSIsaacLabDataConfig).
+    rlds_dataset_type: str | None = None
+    # Enable per-step segment & instruction augmentation for IsaacLabRldsDataset.
+    per_step_segment_aug: bool = False
+    # If true and the RLDS shard contains attr-augmented instruction pools,
+    # merge them with the default segment_instruction_pools before sampling.
+    include_attr_aug_instruction_pool: bool = False
+    # If true, IsaacLabRldsDataset replaces the trailing gripper_dim columns of
+    # `actions` (and the per-segment hold action) with the ±1 binary intent
+    # stored in steps/action_gripper_binary; norm stats must be computed with
+    # this flag set.
+    replace_gripper_with_binary: bool = False
+    # --- read from the shard's dataset_info.json by RLDSIsaacLabDataConfig.create ---
+    # Embodiment behind the joint actions, used to pick the FK model for the EEF
+    # metrics (openpi.eval.robot_fk). None means panda.
+    robot: str | None = None
+    # Arm columns in the action / state vectors (action_dim - gripper_dim).
+    arm_dim: int | None = None
+    state_arm_dim: int | None = None
+    # Online hold-step filter for IsaacLabRldsDataset. A step is "hold" iff
+    #   arm joint velocity   < hold_vel_threshold    (rad/frame)
+    #   |action - state|_arm < hold_cmd_threshold    (rad)
+    #   gripper-state change < hold_gripper_threshold (gripper-state units)
+    # Each hold run is downsampled to its first `hold_keep_per_run` frames; the
+    # leading all-hold prefix is dropped when `hold_filter_head_pause` is True.
+    # Recompute norm_stats after toggling these fields.
+    filter_interior_holds: bool = False
+    hold_vel_threshold: float = 3e-3
+    hold_cmd_threshold: float = 5e-3
+    hold_gripper_threshold: float = 1e-3
+    hold_keep_per_run: int = 1
+    hold_filter_head_pause: bool = True
 
 
 class GroupFactory(Protocol):
@@ -415,6 +459,235 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class RLDSIsaacLabDataConfig(DataConfigFactory):
+    """Config for training on SkillWeaver trajectories in RLDS/TFRecord format.
+
+    Reads the shards written by examples/isaaclab_rlds/convert_npz_to_rlds.py (and
+    examples/libero_rlds/convert_libero_npz_to_rlds.py for LIBERO demos): multiple shard
+    directories, multi-view exterior cameras and per-segment instruction pools. The action
+    representation is fixed at conversion time.
+    """
+
+    rlds_data_dirs: list[str] = dataclasses.field(default_factory=list)
+    # Additional training directories (e.g. LIBERO demos converted to the same format).
+    rlds_extra_dirs_full: list[str] = dataclasses.field(default_factory=list)
+    # Optional held-out directories for val loss evaluation during training.
+    rlds_val_data_dirs: list[str] = dataclasses.field(default_factory=list)
+    # Path to a filter JSON file.  Defaults to None (no filtering — all
+    # converted trajectories are already successful).
+    filter_dict_path: str | None = None
+
+    # Action / state representation — must match the convert_npz_to_rlds.py
+    # flags used to produce the RLDS data.  Used at save_interval to compute
+    # EEF metrics via openpi.eval.action_metrics.
+    arm_repr: str = "joint"    # "joint" | "ee"
+    state_repr: str = "joint"  # "joint" | "ee"
+    # True when actions are incremental:
+    #   arm_action_type=="cmd"  OR  make_target_residual==True
+    arm_is_delta: bool = False
+    gripper_1d: bool = True
+    # Enable per-step segment & instruction augmentation (see per_step_segment_augmentation.md).
+    per_step_segment_aug: bool = False
+    # Include attr-augmented instruction candidates when the RLDS shard provides them.
+    include_attr_aug_instruction_pool: bool = False
+    # Replace gripper action dims with ±1 binary intent recovered from the shard.
+    # See DataConfig.replace_gripper_with_binary for the full contract.
+    replace_gripper_with_binary: bool = False
+    # If True, push DeltaActions/AbsoluteActions onto data_transforms so arm-action
+    # columns are converted to chunk-anchor deltas at training time and converted
+    # back at inference time (Droid-style). Requires absolute arm actions stored
+    # in the shard (arm_is_delta=False) and state_repr matching arm_repr.
+    apply_droid_delta_transform: bool = False
+    # Online hold-step filter (see DataConfig for semantics). Off by default.
+    filter_interior_holds: bool = False
+    hold_vel_threshold: float = 3e-3
+    hold_cmd_threshold: float = 5e-3
+    hold_gripper_threshold: float = 1e-3
+    hold_keep_per_run: int = 1
+    hold_filter_head_pause: bool = True
+    # If False, do not feed the wrist camera to the model: skip the shard's
+    # `observation/wrist_image` field in repack, and have SkillWeaverInputs emit a
+    # zero-tensor with mask=False in the left_wrist_0_rgb slot.
+    use_wrist_camera: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_dict = {
+            "observation/image": "observation/image",
+            "observation/state": "observation/state",
+            "actions": "actions",
+            "prompt": "prompt",
+            "camera_ixt": "camera_ixt",
+            "camera_ixt_hw": "camera_ixt_hw",
+            "camera_ext": "camera_ext",
+            "robot_base_pose_w": "robot_base_pose_w",
+        }
+        if self.use_wrist_camera:
+            repack_dict["observation/wrist_image"] = "observation/wrist_image"
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_dict)])
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                skillweaver_policy.SkillWeaverInputs(
+                    model_type=model_config.model_type,
+                    use_wrist_camera=self.use_wrist_camera,
+                )
+            ],
+            outputs=[skillweaver_policy.SkillWeaverOutputs()],
+        )
+
+        # ------------------------------------------------------------------
+        # Read the shard's own description of the data once, here. Embodiment and
+        # arm width are properties of the recording, not of the experiment, so
+        # they travel in dataset_info.json instead of being restated per config
+        # (and previously, guessed as a hardcoded 7).
+        # ------------------------------------------------------------------
+        _shard_info: dict = {}
+        if self.rlds_data_dirs:
+            import json as _json
+            _p = pathlib.Path(self.rlds_data_dirs[0]) / "dataset_info.json"
+            if _p.is_file():
+                with _p.open() as _f:
+                    _shard_info = _json.load(_f)
+
+        _gripper_dim = 1 if self.gripper_1d else 2
+        _shard_robot = _shard_info.get("robot")
+        _shard_action_dim = int(_shard_info.get("action_dim", -1))
+        _shard_state_dim = int(_shard_info.get("state_dim", -1))
+        if self.arm_repr == "ee":
+            _arm_dim = 6
+        elif _shard_action_dim != -1:
+            _arm_dim = _shard_action_dim - _gripper_dim
+        else:
+            _arm_dim = None
+        if self.state_repr == "ee":
+            _state_arm_dim = 6
+        elif _shard_state_dim != -1:
+            # The state gripper width is its own convert-time flag
+            # (--state_gripper_1d); every current suite matches the action side.
+            _state_arm_dim = _shard_state_dim - _gripper_dim
+        else:
+            _state_arm_dim = None
+
+        if _arm_dim is not None:
+            import openpi.eval.robot_fk as _robot_fk
+            _robot_fk.check_arm_dim(_shard_robot, _arm_dim, arm_repr=self.arm_repr)
+
+        if self.apply_droid_delta_transform:
+            if self.arm_is_delta:
+                raise ValueError(
+                    "apply_droid_delta_transform=True requires arm_is_delta=False "
+                    "(actions in the shard must be absolute targets, otherwise the "
+                    "delta transform would double-subtract the state)."
+                )
+            if self.state_repr != self.arm_repr:
+                raise ValueError(
+                    f"apply_droid_delta_transform=True requires state_repr == arm_repr, "
+                    f"got state_repr='{self.state_repr}' arm_repr='{self.arm_repr}'."
+                )
+            gripper_dim = _gripper_dim
+
+            # gripper_dim is stored per shard, so compare it directly instead of
+            # inferring a mismatch from the action_dim sum (which is an identity
+            # once arm_dim is derived from action_dim).
+            shard_gripper_dim = int(_shard_info.get("gripper_dim", -1))
+            if shard_gripper_dim != -1 and shard_gripper_dim != gripper_dim:
+                raise ValueError(
+                    f"apply_droid_delta_transform: gripper_dim mismatch — "
+                    f"gripper_1d={self.gripper_1d} implies gripper_dim={gripper_dim}, "
+                    f"but {self.rlds_data_dirs[0]}/dataset_info.json was converted "
+                    f"with gripper_dim={shard_gripper_dim}."
+                )
+
+            # arm_dim comes from the shard, never a hardcoded DoF count: the arm is
+            # 7-DoF on Franka but 6-DoF on WidowX.
+            arm_dim = _arm_dim
+            if arm_dim is None:
+                # No dataset_info.json to read: keep the historical assumption.
+                arm_dim = 7 if self.arm_repr == "joint" else 6
+
+            if self.arm_repr == "ee" and arm_dim != 6:
+                raise ValueError(
+                    f"apply_droid_delta_transform: arm_repr='ee' means pos(3)+axis_angle(3), "
+                    f"so arm_dim must be 6, but the shard implies arm_dim={arm_dim} "
+                    f"(action_dim - gripper_dim)."
+                )
+            if arm_dim < 1:
+                raise ValueError(
+                    f"apply_droid_delta_transform: derived arm_dim={arm_dim} is not positive; "
+                    f"check gripper_1d={self.gripper_1d} against {_p}."
+                )
+
+            delta_mask = _transforms.make_bool_mask(arm_dim, -gripper_dim)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        assert self.rlds_data_dirs, "rlds_data_dirs must not be empty for RLDSIsaacLabDataConfig."
+
+        # Shards converted with --no_wrist carry a blank placeholder in the wrist slot.
+        # Feeding that to the model as if it were a camera is always a mistake, so fail
+        # here rather than train on black frames.
+        if self.use_wrist_camera:
+            import json as _json
+            _info_path = pathlib.Path(self.rlds_data_dirs[0]) / "dataset_info.json"
+            if _info_path.is_file():
+                with _info_path.open() as _f:
+                    if _json.load(_f).get("has_wrist") is False:
+                        raise ValueError(
+                            f"use_wrist_camera=True but {_info_path} records has_wrist=false "
+                            f"(converted with --no_wrist, so observation/wrist_image is a blank "
+                            f"placeholder). Set use_wrist_camera=False for this dataset."
+                        )
+
+        out = dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            rlds_data_dirs=list(self.rlds_data_dirs),
+            rlds_extra_dirs_full=list(self.rlds_extra_dirs_full),
+            rlds_val_data_dirs=list(self.rlds_val_data_dirs),
+            rlds_dataset_type="isaaclab",
+            filter_dict_path=self.filter_dict_path,
+            per_step_segment_aug=self.per_step_segment_aug,
+            include_attr_aug_instruction_pool=self.include_attr_aug_instruction_pool,
+            replace_gripper_with_binary=self.replace_gripper_with_binary,
+            robot=_shard_robot,
+            arm_dim=_arm_dim,
+            state_arm_dim=_state_arm_dim,
+            filter_interior_holds=self.filter_interior_holds,
+            hold_vel_threshold=self.hold_vel_threshold,
+            hold_cmd_threshold=self.hold_cmd_threshold,
+            hold_gripper_threshold=self.hold_gripper_threshold,
+            hold_keep_per_run=self.hold_keep_per_run,
+            hold_filter_head_pause=self.hold_filter_head_pause,
+        )
+
+        # When replacing the gripper action with ±1 binary intent, patch the loaded
+        # action norm_stats so the trailing gripper_dim columns are identity for both
+        # Normalize and Unnormalize. This keeps norm_stats.json on disk untouched and
+        # lets the binary ±1 flow through the pipeline unchanged.
+        # Quantile path identity: q01=-1, q99=+1 (since (x − q01)/(q99 − q01)·2 − 1 == x).
+        # Z-score  path identity: mean=0, std=1.
+        if self.replace_gripper_with_binary and out.norm_stats is not None:
+            act_stats = out.norm_stats.get("actions")
+            if act_stats is not None:
+                gd = 1 if self.gripper_1d else 2
+                if act_stats.q01 is not None:
+                    act_stats.q01 = np.concatenate([act_stats.q01[:-gd], np.full(gd, -1.0, act_stats.q01.dtype)])
+                if act_stats.q99 is not None:
+                    act_stats.q99 = np.concatenate([act_stats.q99[:-gd], np.full(gd, +1.0, act_stats.q99.dtype)])
+                act_stats.mean = np.concatenate([act_stats.mean[:-gd], np.full(gd, 0.0, act_stats.mean.dtype)])
+                act_stats.std  = np.concatenate([act_stats.std[:-gd],  np.full(gd, 1.0, act_stats.std.dtype)])
+
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotDROIDDataConfig(DataConfigFactory):
     """
     Example data config for custom DROID dataset in LeRobot format.
@@ -507,6 +780,10 @@ class TrainConfig:
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # How often (in steps) to run validation on data.rlds_val_data_dirs. Set <=0 to disable.
+    eval_interval: int = 1000
+    # Validation examples whose end-effector trajectories are plotted at each validation. 0 = disabled.
+    vis_ee_traj_episodes: int = 0
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -548,6 +825,9 @@ class TrainConfig:
 
 
 # Use `get_config` if you need to get a config by name in your code.
+# Root of the SkillWeaver-RLDS dataset (https://huggingface.co/datasets/Ada-4321/SkillWeaver-RLDS).
+SKILLWEAVER_RLDS_ROOT = os.environ.get("SKILLWEAVER_RLDS_ROOT", "data/SkillWeaver-RLDS")
+
 _CONFIGS = [
     #
     # Inference Aloha configs.
@@ -955,6 +1235,49 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_pi05",
         wandb_enabled=False,
+    ),
+    #
+    # SkillWeaver configs.
+    #
+    # LIBERO-Object: SkillWeaver trajectories for the 10 LIBERO-Object tasks plus the LIBERO-Object
+    # human demonstrations, from the SkillWeaver-RLDS dataset (https://huggingface.co/datasets/Ada-4321/SkillWeaver-RLDS).
+    # Trained on 8 GPUs: `--fsdp-devices 8`.
+    TrainConfig(
+        name="pi05_skillweaver_libero_object",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=RLDSIsaacLabDataConfig(
+            repo_id="skillweaver_libero_object",
+            rlds_data_dirs=[f"{SKILLWEAVER_RLDS_ROOT}/libero_object/train/task{i}" for i in range(10)],
+            rlds_extra_dirs_full=[f"{SKILLWEAVER_RLDS_ROOT}/libero_object/libero_demos"],
+            rlds_val_data_dirs=[f"{SKILLWEAVER_RLDS_ROOT}/libero_object/val/task{i}" for i in range(10)],
+            state_repr="joint",
+            arm_repr="joint",
+            arm_is_delta=False,
+            gripper_1d=True,
+            per_step_segment_aug=False,
+            include_attr_aug_instruction_pool=False,
+            apply_droid_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=10_000,
+        batch_size=256,
+        log_interval=50,
+        save_interval=5000,
+        keep_period=10_000,
+        eval_interval=100,
+        vis_ee_traj_episodes=64,
+        num_workers=0,  # The RLDS loader parallelizes internally.
     ),
     #
     # RoboArena configs.

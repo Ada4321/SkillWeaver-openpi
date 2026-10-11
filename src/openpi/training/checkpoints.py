@@ -49,6 +49,7 @@ def initialize_checkpoint_dir(
             keep_period=keep_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
+            enable_async_checkpointing=False,
         ),
     )
 

@@ -216,6 +216,8 @@ class DeltaActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
+        # Copy in case the input array is read-only (e.g. backed by a tf.Tensor).
+        actions = np.array(actions, copy=True)
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
         data["actions"] = actions
 
@@ -238,6 +240,8 @@ class AbsoluteActions(DataTransformFn):
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
+        # Copy in case the input array is read-only (e.g. backed by a tf.Tensor).
+        actions = np.array(actions, copy=True)
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
         data["actions"] = actions
 

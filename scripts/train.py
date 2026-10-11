@@ -16,6 +16,7 @@ import optax
 import tqdm_loggable.auto as tqdm
 import wandb
 
+import openpi.eval.action_metrics as action_metrics
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -26,6 +27,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import openpi.transforms as _transforms
 
 
 def init_logging():
@@ -191,6 +193,35 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def eval_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    params_for_eval = state.ema_params if state.ema_params is not None else state.params
+    model = nnx.merge(state.model_def, params_for_eval)
+    model.eval()
+
+    observation, actions = batch
+    chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+    return {"loss": jnp.mean(chunked_loss)}
+
+
+def sample_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> at.Array:
+    """Return denoised actions sampled from the model (no gradient)."""
+    params_for_eval = state.ema_params if state.ema_params is not None else state.params
+    model = nnx.merge(state.model_def, params_for_eval)
+    model.eval()
+    return model.sample_actions(rng, batch[0])
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -217,14 +248,33 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    data_config = config.data.create(config.assets_dirs, config.model)
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
     )
+
+    def _strip_camera(b):
+        # The RLDS loader also yields the sampled camera's calibration (obs, actions, camera) for the
+        # validation plots; the training step only takes (obs, actions).
+        if len(b) == 3 and isinstance(b[2], dict):
+            return b[:2]
+        return b
+
     data_iter = iter(data_loader)
-    batch = next(data_iter)
+    batch = _strip_camera(next(data_iter))
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+
+    # Validation on data_config.rlds_val_data_dirs (RLDS datasets only).
+    n_val_batches = 0
+    if data_config.rlds_dataset_type == "isaaclab":
+        _, n_val_batches = _data_loader.create_rlds_val_iter(
+            data_config,
+            action_horizon=config.model.action_horizon,
+            batch_size=config.batch_size,
+            sharding=data_sharding,
+        )
 
     # Log images from first batch to sanity check.
     images_to_log = [
@@ -247,6 +297,47 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
+    peval_step = jax.jit(
+        functools.partial(eval_step, config),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    )
+    psample_step = jax.jit(
+        functools.partial(sample_step, config),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
+    )
+
+    # Extract action-representation settings from data config for save-interval metrics.
+    _arm_repr      = getattr(config.data, "arm_repr",      "joint")
+    _state_repr    = getattr(config.data, "state_repr",    "joint")
+    _arm_is_delta  = getattr(config.data, "arm_is_delta",  False)
+    _gripper_1d    = getattr(config.data, "gripper_1d",    True)
+    # Arm width and embodiment come from the shard (RLDSIsaacLabDataConfig.create
+    # reads dataset_info.json); the 7/6 literals are only the fallback for configs
+    # that carry no shard metadata. Guessing 7 here is what silently fed a WidowX
+    # "6 joints + gripper" vector to the Franka FK — it reshaped cleanly and
+    # produced EE poses ~0.7 m off.
+    _robot         = getattr(data_config, "robot", None)
+    _arm_dim       = getattr(data_config, "arm_dim", None)       or (7 if _arm_repr   == "joint" else 6)
+    _state_arm_dim = getattr(data_config, "state_arm_dim", None) or (7 if _state_repr == "joint" else 6)
+    # data_config (realized) carries the binary-gripper switch; factory copy
+    # is forwarded into it via RLDSIsaacLabDataConfig.create.
+    _replace_gripper_with_binary = getattr(data_config, "replace_gripper_with_binary", False)
+    # use_quantile_norm lives on the realized DataConfig (set inside create_base_config
+    # per model_type), NOT on config.data (the factory); reading it from the factory
+    # silently returns False and silently breaks denormalize → squashed EE-traj vis.
+    _use_quantiles = getattr(data_config, "use_quantile_norm", False)
+
+    # AbsoluteActions instances on the output side undo training-time DeltaActions
+    # (e.g. Droid-style chunk-anchor delta). Apply them in eval below so denoised
+    # predictions and ground-truth get back to the storage-domain action space
+    # before FK; otherwise compute_eef_errors treats deltas as absolute targets.
+    _abs_action_transforms = [
+        t for t in data_config.data_transforms.outputs
+        if isinstance(t, _transforms.AbsoluteActions)
+    ]
+
     start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -267,7 +358,160 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
-        batch = next(data_iter)
+
+        batch = _strip_camera(next(data_iter))
+
+        run_eval = (
+            config.eval_interval > 0
+            and ((step % config.eval_interval == 0 and step > start_step)
+                 or step == config.num_train_steps - 1)
+        )
+        if run_eval:
+            # Full val-set metrics (val/loss + EEF + vis).
+            if n_val_batches > 0:
+                # Create a fresh iterator for one complete pass over the val set.
+                save_val_iter, _ = _data_loader.create_rlds_val_iter(
+                    data_config,
+                    action_horizon=config.model.action_horizon,
+                    batch_size=config.batch_size,
+                    sharding=data_sharding,
+                )
+
+                act_stats   = data_config.norm_stats.get("actions")
+                state_stats = data_config.norm_stats.get("state")
+
+                all_loss            = []
+                all_pos_err         = []
+                all_rot_err         = []
+                all_gripper_err     = []
+                all_gripper_correct = []
+                all_violated        = []
+
+                # Vis collection (first vis_ee_traj_episodes batches only).
+                _vis_n = config.vis_ee_traj_episodes
+                vis_pos_pred:   list[np.ndarray] = []
+                vis_pos_gt:     list[np.ndarray] = []
+                vis_images:     list[np.ndarray] = []
+                vis_cam_params: list[dict]        = []
+
+                for _ in range(n_val_batches):
+                    sv_batch = next(save_val_iter)
+
+                    # Unpack: may be (obs, actions) or (obs, actions, camera_dict).
+                    if len(sv_batch) == 3 and isinstance(sv_batch[2], dict):
+                        sv_obs, sv_actions, sv_camera = sv_batch
+                    else:
+                        sv_obs, sv_actions = sv_batch[0], sv_batch[1]
+                        sv_camera = None
+
+                    # Metric 1: flow-matching velocity MSE (same as training)
+                    with sharding.set_mesh(mesh):
+                        sv_info = peval_step(train_rng, train_state, (sv_obs, sv_actions))
+                    all_loss.append(float(jax.device_get(sv_info["loss"])))
+
+                    # Metrics 2+3: denoised EEF errors
+                    if act_stats is not None:
+                        with sharding.set_mesh(mesh):
+                            pred_norm = jax.device_get(psample_step(train_rng, train_state, (sv_obs, sv_actions)))
+                        gt_norm   = jax.device_get(sv_actions)
+                        obs_state = jax.device_get(sv_obs.state)
+
+                        # Model uses padded action/state dims (e.g. 32); norm_stats are in the real dim (e.g. 8).
+                        act_dim = int(np.asarray(act_stats.mean).shape[0])
+                        pred_phys = action_metrics.denormalize(np.array(pred_norm)[..., :act_dim], act_stats, use_quantiles=_use_quantiles)
+                        gt_phys   = action_metrics.denormalize(np.array(gt_norm)[..., :act_dim],   act_stats, use_quantiles=_use_quantiles)
+                        if state_stats is not None:
+                            state_dim = int(np.asarray(state_stats.mean).shape[0])
+                            obs_phys = action_metrics.denormalize(np.array(obs_state)[..., :state_dim], state_stats, use_quantiles=_use_quantiles)
+                        else:
+                            obs_phys = np.array(obs_state)
+
+                        # Undo training-time DeltaActions (e.g. Droid-style relative)
+                        # so pred/gt are in storage-domain action space before FK.
+                        for _abs_t in _abs_action_transforms:
+                            pred_phys = _abs_t({"state": obs_phys, "actions": pred_phys})["actions"]
+                            gt_phys   = _abs_t({"state": obs_phys, "actions": gt_phys})["actions"]
+
+                        per_sample = action_metrics.compute_eef_errors(
+                            pred_phys,
+                            gt_phys,
+                            obs_phys,
+                            arm_repr=_arm_repr,
+                            arm_dim=_arm_dim,
+                            state_arm_dim=_state_arm_dim,
+                            arm_is_delta=_arm_is_delta,
+                            gripper_1d=_gripper_1d,
+                            replace_gripper_with_binary=_replace_gripper_with_binary,
+                            robot=_robot,
+                        )
+                        all_pos_err.append(per_sample["pos_err"])
+                        all_rot_err.append(per_sample["rot_err"])
+                        all_gripper_err.append(per_sample["gripper_err"])
+                        all_gripper_correct.append(per_sample["gripper_correct"])
+                        all_violated.append(per_sample["violated"])
+
+                        # Collect for EE traj vis (limited to first _vis_n batches).
+                        if _vis_n > 0 and len(vis_pos_pred) < _vis_n:
+                            pp, pg = action_metrics.extract_ee_positions(
+                                pred_phys, gt_phys, obs_phys,
+                                arm_repr=_arm_repr,
+                                arm_dim=_arm_dim,
+                                state_arm_dim=_state_arm_dim,
+                                arm_is_delta=_arm_is_delta,
+                                robot=_robot,
+                            )
+                            front_key = "base_0_rgb"
+                            front_img = np.array(jax.device_get(sv_obs.images[front_key]))  # (B, H, W, 3)
+                            B = pp.shape[0]
+                            for b in range(B):
+                                if len(vis_pos_pred) >= _vis_n:
+                                    break
+                                vis_pos_pred.append(pp[b])
+                                vis_pos_gt.append(pg[b])
+                                vis_images.append(front_img[b])
+                                if sv_camera is not None:
+                                    vis_cam_params.append({k: np.array(v[b]) for k, v in sv_camera.items()})
+
+                save_metrics = {"val/loss": float(np.mean(all_loss))}
+                if all_pos_err:
+                    eef_metrics = action_metrics.summarize_eef_metrics(
+                        pos_err=np.concatenate(all_pos_err),
+                        rot_err=np.concatenate(all_rot_err),
+                        gripper_err=np.concatenate(all_gripper_err),
+                        violated=np.concatenate(all_violated),
+                        gripper_correct=np.concatenate(all_gripper_correct),
+                    )
+                    save_metrics.update({f"val/{k}": v for k, v in eef_metrics.items()})
+
+                wandb.log(save_metrics, step=step)
+                msg = (
+                    f"Step {step} [eval]: val/loss={save_metrics['val/loss']:.4f}"
+                )
+                if "val/eef_pos_err" in save_metrics:
+                    msg += f"  eef_pos={save_metrics['val/eef_pos_err']*100:.2f}cm"
+                    msg += f"  eef_rot={save_metrics['val/eef_rot_err']:.3f}rad"
+                pbar.write(msg)
+
+                # EE trajectory visualization.
+                if _vis_n > 0 and vis_pos_pred:
+                    import pathlib as _pathlib
+                    _vis_dir = _pathlib.Path(config.checkpoint_dir) / "ee_traj_vis"
+                    _vis_dir.mkdir(parents=True, exist_ok=True)
+                    _pos_pred_arr = np.stack(vis_pos_pred)  # (N, H, 3)
+                    _pos_gt_arr   = np.stack(vis_pos_gt)    # (N, H, 3)
+                    _png_3d = action_metrics._plot_ee_traj_3d(_pos_pred_arr, _pos_gt_arr)
+                    _png_3d_path = _vis_dir / f"ee_traj_3d_{step:07d}.png"
+                    _png_3d_path.write_bytes(_png_3d)
+                    vis_metrics = {"vis/ee_traj_3d": wandb.Image(str(_png_3d_path))}
+                    if vis_cam_params and len(vis_cam_params) == len(vis_pos_pred):
+                        _imgs_arr = np.stack(vis_images)  # (N, H, W, 3)
+                        _png_front = action_metrics._plot_ee_traj_front(
+                            _pos_pred_arr, _pos_gt_arr, _imgs_arr, vis_cam_params
+                        )
+                        _png_front_path = _vis_dir / f"ee_traj_front_{step:07d}.png"
+                        _png_front_path.write_bytes(_png_front)
+                        vis_metrics["vis/ee_traj_front"] = wandb.Image(str(_png_front_path))
+                    wandb.log(vis_metrics, step=step)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)

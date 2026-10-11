@@ -1,5 +1,9 @@
 # Data directories.
-assets/
+# Normalization statistics (norm_stats.json) are tracked so configs ship with the statistics they were
+# trained with; anything else under assets/ stays ignored.
+assets/**
+!assets/**/
+!assets/**/norm_stats.json
 checkpoints/
 data/
 wandb/

@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -14,6 +15,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.isaaclab_rlds_dataset import IsaacLabRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -158,15 +160,33 @@ def create_rlds_dataset(
     *,
     shuffle: bool = False,
 ) -> Dataset:
-    # At the moment, we only support DROID for RLDS datasets.
-    return DroidRldsDataset(
-        data_dir=data_config.rlds_data_dir,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        action_chunk_size=action_horizon,
-        action_space=data_config.action_space,
-        filter_dict_path=data_config.filter_dict_path,
-    )
+    if data_config.rlds_dataset_type == "isaaclab":
+        return IsaacLabRldsDataset(
+            data_dirs=data_config.rlds_data_dirs,
+            extra_dirs_full=data_config.rlds_extra_dirs_full,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            action_chunk_size=action_horizon,
+            per_step_segment_aug=data_config.per_step_segment_aug,
+            include_attr_aug_instruction_pool=data_config.include_attr_aug_instruction_pool,
+            replace_gripper_with_binary=data_config.replace_gripper_with_binary,
+            filter_interior_holds=data_config.filter_interior_holds,
+            hold_vel_threshold=data_config.hold_vel_threshold,
+            hold_cmd_threshold=data_config.hold_cmd_threshold,
+            hold_gripper_threshold=data_config.hold_gripper_threshold,
+            hold_keep_per_run=data_config.hold_keep_per_run,
+            hold_filter_head_pause=data_config.hold_filter_head_pause,
+        )
+    if data_config.rlds_dataset_type in (None, "droid"):
+        return DroidRldsDataset(
+            data_dir=data_config.rlds_data_dir,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            action_chunk_size=action_horizon,
+            action_space=data_config.action_space,
+            filter_dict_path=data_config.filter_dict_path,
+        )
+    raise ValueError(f"Unknown rlds_dataset_type: {data_config.rlds_dataset_type!r}")
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
@@ -242,7 +262,7 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
-    if data_config.rlds_data_dir is not None:
+    if data_config.rlds_data_dir is not None or data_config.rlds_dataset_type is not None:
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -376,6 +396,49 @@ def create_rlds_data_loader(
     )
 
     return DataLoaderImpl(data_config, data_loader)
+
+
+def create_rlds_val_iter(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    batch_size: int,
+    sharding: jax.sharding.Sharding | None = None,
+) -> tuple[Iterator, int] | tuple[None, int]:
+    """Create a validation iterator over data_config.rlds_val_data_dirs.
+
+    Returns (iterator, n_val_batches), or (None, 0) if there are no validation dirs. The iterator repeats
+    forever (IsaacLabRldsDataset uses dataset.repeat()), so callers take n_val_batches batches for one pass.
+    Normalization uses the training norm stats.
+    """
+    val_dirs = data_config.rlds_val_data_dirs
+    if not val_dirs:
+        return None, 0
+
+    import math
+
+    from examples.isaaclab_rlds.dataset_builder import DatasetInfo
+
+    total_episodes = sum(DatasetInfo.load(d).total_episodes for d in val_dirs)
+    n_val_batches = max(1, math.ceil(total_episodes / batch_size))
+
+    # Validate on the validation dirs only (no extra training dirs), with the same transforms and norm stats.
+    val_data_config = dataclasses.replace(data_config, rlds_data_dirs=list(val_dirs), rlds_extra_dirs_full=[])
+    # shuffle=True: without it the first n_val_batches batches would only cover the first frames of the
+    # first episodes, since trajectories are flattened into consecutive steps.
+    val_loader = create_rlds_data_loader(
+        val_data_config,
+        action_horizon=action_horizon,
+        batch_size=batch_size,
+        sharding=sharding,
+        shuffle=True,
+    )
+    logging.info(
+        "Initialized RLDS val iterator from %d dir(s) (total_episodes=%d, n_val_batches=%d)",
+        len(val_dirs),
+        total_episodes,
+        n_val_batches,
+    )
+    return iter(val_loader), n_val_batches
 
 
 class TorchDataLoader:
@@ -535,6 +598,14 @@ class DataLoaderImpl(DataLoader):
     def data_config(self) -> _config.DataConfig:
         return self._data_config
 
+    # Camera calibration passed through by SkillWeaverInputs for end-effector trajectory visualization.
+    _CAMERA_KEYS = ("camera_ixt", "camera_ixt_hw", "camera_ext", "robot_base_pose_w")
+
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            observation = _model.Observation.from_dict(batch)
+            camera = {k: batch[k] for k in self._CAMERA_KEYS if k in batch}
+            if camera:
+                yield observation, batch["actions"], camera
+            else:
+                yield observation, batch["actions"]
